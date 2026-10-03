@@ -1,0 +1,146 @@
+name: Infra (OpenTofu)
+
+# GitOps flow:
+#   - Pull requests targeting main: init/validate/plan only, plan posted as a
+#     PR comment for human review. No infrastructure is changed.
+#   - Push to main (i.e. a PR merge): init/apply. This is the only path that
+#     changes real infrastructure, and it only runs after a PR has been
+#     reviewed and merged.
+#
+# Prerequisites before this workflow can apply against real AWS (see README
+# "CI/CD and approval flow" section for details):
+#   1. backend.tf must be switched from the local backend to a remote one
+#      (an S3 + DynamoDB example is included as a comment in backend.tf).
+#   2. An AWS_ROLE_ARN repository secret (OIDC role) must be configured.
+#   3. Branch protection on main should require PR review before merging.
+#   4. Optionally, add required reviewers to the "production" GitHub
+#      Environment below for a second, manual approval gate on apply.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - ".github/workflows/infra.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - ".github/workflows/infra.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  TOFU_VERSION: "1.13.1"
+  TF_VAR_use_localstack: "false"
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Validate & Plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: tofu init
+        id: init
+        run: tofu init -input=false
+
+      - name: tofu validate
+        id: validate
+        run: tofu validate -no-color
+
+      - name: tofu plan
+        id: plan
+        run: |
+          set -o pipefail
+          tofu plan -no-color -input=false -out=tfplan 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require("fs");
+            const outcome = process.env.PLAN_OUTCOME;
+            let output = "(no plan output captured)";
+            try {
+              output = fs.readFileSync("plan_output.txt", "utf8");
+            } catch (err) {
+              // file missing, e.g. if tofu init failed before plan ran
+            }
+            const truncated = output.length > 60000
+              ? output.slice(0, 60000) + "\n... (truncated)"
+              : output;
+
+            const body = [
+              `#### \`tofu plan\` — ${outcome === "success" ? "✅ Success" : "❌ Failed"}`,
+              "",
+              "<details><summary>Show plan output</summary>",
+              "",
+              "```hcl",
+              truncated || "(no output captured)",
+              "```",
+              "</details>",
+              "",
+              `*Pushed by @${context.actor} — commit \`${context.sha.slice(0, 7)}\`*`,
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    name: Apply
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: tofu init
+        run: tofu init -input=false
+
+      - name: tofu apply
+        run: tofu apply -auto-approve -input=false
